@@ -53,6 +53,86 @@ async function collect(env) {
   return out;
 }
 
+
+const awsTe = new TextEncoder();
+async function sha256HexAws(data) {
+  const d = await crypto.subtle.digest("SHA-256", typeof data === "string" ? awsTe.encode(data) : data);
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function hmacSha256Aws(key, msg) {
+  const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const s = await crypto.subtle.sign("HMAC", k, typeof msg === "string" ? awsTe.encode(msg) : msg);
+  return new Uint8Array(s);
+}
+async function awsFetch(env, service, region, host, method, path, query) {
+  const ak = env.AWS_ACCESS_KEY_ID;
+  const sk = env.AWS_SECRET_ACCESS_KEY;
+  const amzDate = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + "Z";
+  const dateStamp = amzDate.slice(0, 8);
+  const payloadHash = await sha256HexAws("");
+  const headers = { host: host, "x-amz-date": amzDate };
+  const signedHeaders = Object.keys(headers).sort().join(";");
+  const canonicalHeaders = Object.keys(headers).sort().map((k) => k + ":" + String(headers[k]).trim() + "\n").join("");
+  const canonicalQuery = Object.keys(query).sort().map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(query[k])).join("&");
+  const canonicalRequest = [method, path, canonicalQuery, canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const scope = [dateStamp, region, service, "aws4_request"].join("/");
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, await sha256HexAws(canonicalRequest)].join("\n");
+  const kDate = await hmacSha256Aws(awsTe.encode("AWS4" + sk), dateStamp);
+  const kRegion = await hmacSha256Aws(kDate, region);
+  const kService = await hmacSha256Aws(kRegion, service);
+  const kSigning = await hmacSha256Aws(kService, "aws4_request");
+  const sig = [...(await hmacSha256Aws(kSigning, stringToSign))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const url = "https://" + host + path + (canonicalQuery ? "?" + canonicalQuery : "");
+  const res = await fetch(url, { method: method, headers: { host: host, "x-amz-date": amzDate, Authorization: "AWS4-HMAC-SHA256 Credential=" + ak + "/" + scope + ", SignedHeaders=" + signedHeaders + ", Signature=" + sig } });
+  const text = await res.text();
+  if (!res.ok) throw new Error(service + " " + res.status + ": " + text.slice(0, 300));
+  return text;
+}
+function parseEc2Instances(xml) {
+  const set = (xml.match(/<instancesSet>([\s\S]*?)<\/instancesSet>/) || [])[1] || "";
+  const marked = set.replace(/<tagSet>([\s\S]*?)<\/tagSet>/g, (m, inner) => "<hastags>" + (/<item>/.test(inner) ? "1" : "0") + "</hastags>");
+  return marked.split(/<item>/).slice(1).map((c) => ({
+    id: ((c.match(/<instanceId>([^<]+)<\/instanceId>/) || [])[1] || ""),
+    state: ((c.match(/<name>([^<]+)<\/name>/) || [])[1] || ""),
+    type: ((c.match(/<instanceType>([^<]+)<\/instanceType>/) || [])[1] || ""),
+    tagged: (((c.match(/<hastags>([^<]*)<\/hastags>/) || [])[1] || "0") === "1"),
+  })).filter((i) => i.id);
+}
+async function collectAws(env) {
+  const region = env.AWS_REGION || "us-east-1";
+  const out = [];
+  try {
+    const sts = await awsFetch(env, "sts", region, "sts." + region + ".amazonaws.com", "GET", "/", { Action: "GetCallerIdentity", Version: "2011-06-15" });
+    const acct = (sts.match(/<Account>([^<]+)<\/Account>/) || [])[1] || "unknown";
+    out.push(["identity", "info", "AWS account " + acct + " connected (" + region + ")"]);
+  } catch (e) {
+    out.push(["identity", "high", "AWS credential check failed: " + String((e && e.message) || e).slice(0, 200)]);
+    return out;
+  }
+  try {
+    const ec2 = await awsFetch(env, "ec2", region, "ec2." + region + ".amazonaws.com", "GET", "/", { Action: "DescribeInstances", Version: "2016-11-15" });
+    const inst = parseEc2Instances(ec2);
+    const running = inst.filter((i) => i.state === "running");
+    const stopped = inst.filter((i) => i.state === "stopped");
+    out.push(["inventory", "info", "AWS EC2: " + running.length + " running, " + stopped.length + " stopped in " + region]);
+    const untagged = running.filter((i) => !i.tagged).length;
+    if (untagged > 0) out.push(["cost-tags", "medium", untagged + " of " + running.length + " running instances lack tags — spend cannot be attributed"]);
+    if (stopped.length > 0) out.push(["idle", "medium", stopped.length + " stopped instances still hold EBS volumes (snapshot + terminate to save)"]);
+    const legacy = running.filter((i) => /^(t2|m3|m4|c3|c4|r3)\./.test(i.type)).length;
+    if (legacy > 0) out.push(["rightsizing", "medium", legacy + " running instances on previous-generation families — consider rightsizing"]);
+  } catch (e) {
+    out.push(["inventory", "high", "EC2 describe failed: " + String((e && e.message) || e).slice(0, 200)]);
+  }
+  try {
+    const s3 = await awsFetch(env, "s3", "us-east-1", "s3.amazonaws.com", "GET", "/", {});
+    const buckets = [...s3.matchAll(/<Name>([^<]+)<\/Name>/g)].map((m) => m[1]);
+    out.push(["inventory", "info", "AWS S3: " + buckets.length + " buckets"]);
+  } catch (e) {
+    out.push(["inventory", "high", "S3 list failed: " + String((e && e.message) || e).slice(0, 200)]);
+  }
+  return out;
+}
+
 async function storeFindings(env, rows, provider) {
   for (const [category, severity, title] of rows) {
     await env.DB.prepare(
@@ -142,7 +222,14 @@ export default {
         await env.DB.prepare("INSERT INTO runs (id, kind, status, detail) VALUES (?, 'collect', 'ok', ?)").bind(crypto.randomUUID(), rows.length + " findings").run();
         return Response.json({ ok: true, stored: rows.length });
       }
-      if (url.pathname === "/api/summary") {
+            if (url.pathname === "/api/collect/aws" && request.method === "POST") {
+        if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) return Response.json({ error: "Missing AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets." }, { status: 500 });
+        const rows = await collectAws(env);
+        await storeFindings(env, rows, "aws");
+        await env.DB.prepare("INSERT INTO runs (id, kind, status, detail) VALUES (?, 'collect-aws', 'ok', ?)").bind(crypto.randomUUID(), rows.length + " findings").run();
+        return Response.json({ ok: true, stored: rows.length });
+      }
+if (url.pathname === "/api/summary") {
         const rows = await env.DB.prepare("SELECT provider,severity,title FROM findings ORDER BY created_at DESC LIMIT 50").all();
         const out = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
           messages: [

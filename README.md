@@ -41,6 +41,17 @@ wrangler secret put CF_API_TOKEN
 
 Set `CF_ACCOUNT_ID` in `wrangler.jsonc` vars or as a secret.
 
+## AWS live collection
+
+`POST /api/collect/aws` scans EC2/S3 with SigV4 (read-only IAM key). Set secrets first:
+
+```bash
+wrangler secret put AWS_ACCESS_KEY_ID
+wrangler secret put AWS_SECRET_ACCESS_KEY
+```
+
+Optional var: `AWS_REGION` (default `us-east-1`).
+
 ## Try it
 
 ```bash
