@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "appzed-finops-agent",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "ai": {
+    "binding": "AI"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "appzed-finops-agent-db"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "15 8 * * 1"
+    ]
+  }
+}
